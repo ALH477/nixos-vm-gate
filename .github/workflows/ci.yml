@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: flake check
+        run: nix flake check --all-systems --no-build
+
+      - name: formatting
+        run: |
+          nix build .#formatter.x86_64-linux --out-link .fmt
+          ./.fmt/bin/nixfmt --check flake.nix modules/vm-gate.nix
+
+      # The harness scripts are @token@ templates consumed by writeShellScript,
+      # so the placeholders are compile-time constants. SC2050/SC2194 only fire
+      # on that substitution and are not real findings.
+      - name: shellcheck
+        run: |
+          mkdir -p .lint
+          for f in modules/*.sh; do
+            { echo '#!/usr/bin/env bash'; sed -E 's/@[A-Za-z]+@/PLACEHOLDER/g' "$f"; } \
+              > ".lint/$(basename "$f")"
+          done
+          nix run nixpkgs#shellcheck -- -S warning -e SC2050,SC2194 .lint/*.sh
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # Builds the demo host end to end, which also exercises the module's own
+      # evaluation and shellchecks every health-check fragment via
+      # writeShellApplication. It does not boot the VM: no /dev/kvm on the
+      # runner, and an emulated boot is too slow for CI.
+      - name: build demo-vm
+        run: nix build .#demo-vm --no-link --print-build-logs
