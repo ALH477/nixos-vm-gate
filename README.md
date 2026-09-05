@@ -1,7 +1,5 @@
 # vm-gate
 
-[![ci](https://github.com/ALH477/nixos-vm-gate/actions/workflows/ci.yml/badge.svg)](https://github.com/ALH477/nixos-vm-gate/actions/workflows/ci.yml)
-
 Boots the next NixOS generation in a throwaway VM and activates it only if it
 came back clean.
 
