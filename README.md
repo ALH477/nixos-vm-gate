@@ -168,6 +168,55 @@ All under `demod.vmGate`:
 | `showDiff` | `true` | closure diff before gating |
 | `installWrapper` / `package` | `true` / read-only | wrapper placement |
 
+## Prior art
+
+The pieces this composes all exist separately. What was missing is the wiring.
+
+**`nixos-rebuild build-vm` / `build-vm-with-bootloader`** do the VM boot, and
+`dry-activate` and `test` cover part of the rest. They are the primitives this
+automates. Run by hand, nothing connects the VM's outcome to the activation
+decision, and each invocation evaluates again — so the tree you tested and the
+tree you switch to are only probably the same.
+
+**`system.preSwitchChecks`** (nixpkgs, in 25.05) is the closest thing in the
+tree: an attrset of shell fragments run by `switch-to-configuration` before it
+commits, where any failure aborts the switch. Same shape as `checks` here, and
+also shellchecked via `writeShellApplication`. It runs on the live host, so it
+asserts preconditions; it cannot answer whether the new generation comes up.
+The two compose — use `preSwitchChecks` for "is this host in a fit state to
+switch", and the gate for "does the thing I am about to switch to work".
+
+**Post-activation rollback** — [deploy-rs](https://github.com/serokell/deploy-rs)
+magic rollback, which drops a canary the deployer must clear before a timeout,
+and the various dead-man-switch wrappers — takes the opposite approach: activate,
+then undo if it goes wrong. That covers what a cold VM boot structurally cannot,
+namely the live old-to-new unit diff (see *What it does not catch*). Complementary,
+not competing. The difference in risk posture is that a rollback tool does
+activate the bad generation first.
+
+**Boot counting** (`boot.loader.systemd-boot.bootCounting`, currently
+nixos-unstable only — not in 25.05 or 25.11) is the firmware-level backstop for
+the same failure mode `useBootLoader = true` targets: systemd-boot decrements a
+per-entry counter and `systemd-bless-boot` marks an entry good once the boot
+succeeds. Worth enabling alongside this once it reaches your channel; it catches
+what the gate missed.
+
+**NixOS VM tests** (`runNixOSTest`) are a far more capable assertion framework —
+multi-node, a Python driver, and they run under `nix flake check` in CI. They
+test a purpose-built configuration, though, and aiming one at your real
+`nixosConfigurations.<host>` is known to be awkward. This gate inverts that: weak
+assertions against the exact closure you are about to activate.
+
+**Fleet deployment tooling** — [morph](https://github.com/DBCDK/morph)
+(`deployment.healthChecks`, command and HTTP, repeated until success),
+[colmena](https://github.com/nix-community/colmena),
+[nixos-healthchecks](https://github.com/mrVanDalo/nixos-healthchecks) — runs
+checks after deploying to remote hosts. This is local and runs before activation.
+
+What is left over, and what this is actually for: one evaluation shared between
+the VM and the activation target, a closure pinned against the collector across
+the gate window, and a verdict that gates rather than reverts.
+
 ## Repository layout
 
 ```
