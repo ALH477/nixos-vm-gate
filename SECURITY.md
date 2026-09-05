@@ -11,6 +11,15 @@ assume.
 What the design does provide is blast-radius reduction for the case where a
 trusted input turns out to be compromised or simply broken.
 
+The host does cross-check the verdict against the rest of what the harness
+should have produced: `system-state` and `failed-units` must both be present,
+and a passing verdict that claims success while systemd reports anything other
+than `running` is rejected. That closes the accidental passes — an early
+poweroff, a truncated share, a unit that writes a `0` before the checks run —
+and raises the cost of a deliberate one from writing one file to writing a
+consistent set. It does not close the deliberate case, and no in-guest check
+can: the guest is the thing under test.
+
 ## Privilege split
 
 | Step | Runs as |
@@ -19,10 +28,41 @@ trusted input turns out to be compromised or simply broken.
 | Boot the gate VM, run guest code | `demod.vmGate.user` (unprivileged, `kvm` group only) |
 | Activate the validated closure | root, via `vm-gate-activate` |
 
-QEMU never runs as root. It parses a guest-controlled disk image and maps a host
-directory into the guest, so a qemu escape from a root-owned VM would land on
-root directly. Running it as a dedicated system account means an escape lands on
-an account whose only privilege is `/dev/kvm`.
+QEMU never runs as root, and this matters more than the usual escape argument.
+
+The VM runner exports three host directories over 9p with
+`security_model=none`, which is passthrough: the 9p server creates files using
+the credentials the guest asks for, with the process's own privileges. Those
+exports are the host's `/nix/store`, and `$TMPDIR/xchg` and `$SHARED_DIR` for
+the guest's scratch space. With qemu running as root, a guest would not need an
+escape at all — ordinary 9p writes would let it plant a setuid-root binary in
+the shared directory, or add paths to the host's store. Running as an
+unprivileged account reduces that to files owned by an account whose only
+privilege is `/dev/kvm`.
+
+The verdict share at `/vmgate` is the exception: it uses the `mapped-xattr`
+default, so guest-requested ownership and mode are stored as host xattrs rather
+than applied. The guest cannot use it to create a host file it does not already
+have the rights to create.
+
+The gate user therefore must not have privileges that make those exports
+writable in an interesting way. The module warns if it is in the `nixbld` group
+(`/nix/store` is group-writable by `nixbld`, and the sticky bit stops replacing
+existing paths, not adding new ones) or if it is a Nix trusted user, which is
+root-equivalent through the daemon. The default `createUser = true` account has
+neither.
+
+The gate process is additionally launched under `setpriv --no-new-privs`, so an
+escaped process cannot regain privilege through any setuid binary it reaches.
+
+Only the verdict share and a scratch directory are handed to the gate user. The
+workspace root stays root-owned and merely traversable, so a guest that does get
+out of qemu cannot unlink the GC roots pinning the closure about to be
+activated, nor rewrite the console log that records its own run.
+
+**Running the wrapper as an unprivileged user gets no privilege split at all.**
+In that path qemu runs as the invoking user — who, by construction, can `sudo`
+to activate. The split exists only when the wrapper itself runs as root.
 
 The gate VM has no network by default (`virtualisation.restrictNetwork`). Turn it
 on with `demod.vmGate.network = true` only when a health check needs it, and
@@ -55,6 +95,18 @@ checks.api = ''
     http://localhost/health >/dev/null
 '';
 ```
+
+## Concurrency
+
+Two gated rebuilds reaching activation together would race `nix-env --set` on
+the system profile. The lock that prevents this is taken by `vm-gate-activate`
+as root, on `/run/lock/vm-gate-activate.lock`, and is held across
+`switch-to-configuration` — not by the wrapper. An unprivileged caller cannot
+write a machine-global lock path, so a wrapper-side lock would be per-user at
+best and would silently permit the race it appears to prevent.
+
+The wrapper still takes a best-effort lock so a second run fails fast instead of
+burning a VM boot it cannot use. Treat that one as a convenience.
 
 ## Diagnostics
 

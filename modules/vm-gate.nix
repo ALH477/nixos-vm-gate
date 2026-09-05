@@ -75,6 +75,7 @@ let
   activateHelper = pkgs.writeShellScriptBin "vm-gate-activate" (
     subst {
       coreutils = "${pkgs.coreutils}/bin";
+      utilLinux = "${pkgs.util-linux}/bin";
       nixEnv = "${config.nix.package}/bin/nix-env";
       nixStore = "${config.nix.package}/bin/nix-store";
     } ./vm-gate-activate.sh
@@ -86,6 +87,7 @@ let
       utilLinux = "${pkgs.util-linux}/bin";
       env = "${pkgs.coreutils}/bin/env";
       runuser = "${pkgs.util-linux}/bin/runuser";
+      setpriv = "${pkgs.util-linux}/bin/setpriv";
       nix = "${config.nix.package}/bin/nix";
       nixStore = "${config.nix.package}/bin/nix-store";
       jq = "${pkgs.jq}/bin/jq";
@@ -101,6 +103,7 @@ let
       keepRuns = toString cfg.keepRuns;
       allowOverride = if cfg.allowOverride then "1" else "0";
       showDiff = if cfg.showDiff then "1" else "0";
+      requireRunning = if cfg.requireSystemRunning then "1" else "0";
     } ./nixos-rebuild-gated.sh
   );
 
@@ -408,7 +411,19 @@ in
         "demod.vmGate: with a tmpfs guest root, ${toString cfg.memorySize} MiB may run out during activation. 4096 is the tested default."
       ++
         lib.optional (cfg.activation == "from-current")
-          "demod.vmGate.activation = \"from-current\" is experimental; the rewind phase will report mount failures for the host's real disks.";
+          "demod.vmGate.activation = \"from-current\" is experimental; the rewind phase will report mount failures for the host's real disks."
+      ++
+        # The runner exports the host's /nix/store to the guest over 9p with
+        # security_model=none, so the 9p server writes with the gate user's
+        # credentials. /nix/store is group-writable by nixbld, which would let a
+        # guest create paths in the host store without needing a qemu escape at
+        # all. The sticky bit stops it replacing existing paths, not adding new
+        # ones.
+        lib.optional (lib.elem "nixbld" (config.users.users.${cfg.user}.extraGroups or [ ]))
+          "demod.vmGate.user '${cfg.user}' is in the nixbld group, which is group-writable on /nix/store. A guest can then create paths in the host store through the 9p export. Use a dedicated account."
+      ++
+        lib.optional (lib.elem cfg.user (config.nix.settings.trusted-users or [ ]))
+          "demod.vmGate.user '${cfg.user}' is a Nix trusted user, which is root-equivalent via the daemon. That defeats the point of running qemu unprivileged.";
 
     virtualisation.vmVariant = lib.mkIf (!cfg.useBootLoader) {
       imports = [

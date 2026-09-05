@@ -246,16 +246,36 @@ trap cleanup EXIT INT TERM
 work="$(pick_workspace)"
 chmod 0700 "$work"
 share="$work/share"
-mkdir -p "$share"
+scratch="$work/scratch"
+mkdir -p "$share" "$scratch"
 
-# One lock for the whole gate-then-activate sequence: two concurrent runs would
-# race on the system profile.
-lock_file="${work}/lock"
-if [[ -d /run/lock && -w /run/lock ]]; then
-  lock_file=/run/lock/vm-gate.lock
+# Advisory lock over the gate-then-activate sequence, so a second run fails fast
+# with a clear message instead of burning a VM boot it will not get to use.
+#
+# This is a courtesy, not the guarantee: an unprivileged caller cannot write a
+# machine-global path, so the best available scope is per-user (XDG_RUNTIME_DIR
+# is 0700 and per-uid). Two different users, or a user plus root, still reach
+# activation concurrently. The lock that actually prevents a profile race is
+# taken by vm-gate-activate as root; see SECURITY.md.
+pick_lock_file() {
+  if ((EUID == 0)) && [[ -d /run/lock && -w /run/lock ]]; then
+    printf '%s\n' /run/lock/vm-gate.lock
+    return 0
+  fi
+  local runtime="${XDG_RUNTIME_DIR:-}"
+  if [[ -n $runtime && -d $runtime && -w $runtime ]]; then
+    printf '%s\n' "${runtime}/vm-gate.lock"
+    return 0
+  fi
+  return 1
+}
+
+if lock_file="$(pick_lock_file)"; then
+  exec 8>"$lock_file"
+  flock -n 8 || die "another gated rebuild is already running"
+else
+  log "no writable lock directory; relying on vm-gate-activate to serialise activation"
 fi
-exec 8>"$lock_file"
-flock -n 8 || die "another gated rebuild is already running"
 
 # --- single evaluation ------------------------------------------------------
 # Both installables come from one 'nix build' invocation, so they are guaranteed
@@ -323,9 +343,13 @@ runner="$(echo "$vm"/bin/run-*-vm)"
 
 readlink -f /run/current-system >"$share/old-system" 2>/dev/null || true
 
-vm_env=("VM_GATE_DIR=${share}" "TMPDIR=${work}" "HOME=${work}")
+# The runner exports $TMPDIR/xchg and $SHARED_DIR to the guest over 9p with
+# security_model=none, so whatever TMPDIR points at is guest-writable. Point it
+# at a scratch directory rather than the workspace root, which holds the GC
+# roots and the console log.
+vm_env=("VM_GATE_DIR=${share}" "TMPDIR=${scratch}" "HOME=${scratch}")
 if [[ $use_bootloader == 1 ]]; then
-  vm_env+=("NIX_DISK_IMAGE=${work}/gate.qcow2")
+  vm_env+=("NIX_DISK_IMAGE=${scratch}/gate.qcow2")
 fi
 
 vm_cmd=()
@@ -334,8 +358,23 @@ if ((EUID == 0)); then
   # host directory into it. Root keeps only the activation step.
   id -u "$gate_user" >/dev/null 2>&1 ||
     die "gate user '${gate_user}' does not exist; set demod.vmGate.createUser = true"
-  chown -R "$gate_user" "$work"
-  vm_cmd=("@runuser@" -u "$gate_user" -- "$ENV_BIN" "${vm_env[@]}" "$runner")
+
+  # Hand the gate user only what qemu has to write: the verdict share and its
+  # own scratch directory. The workspace root stays root-owned and merely
+  # traversable, so a guest that gets out of qemu cannot unlink the GC roots
+  # holding the closure that is about to be activated, and cannot rewrite the
+  # console log that is the record of its own run.
+  chown "$gate_user" "$share" "$scratch"
+  chmod 0700 "$share" "$scratch"
+  chmod 0711 "$work"
+
+  # no-new-privs: an escaped process cannot regain privilege through any setuid
+  # binary it can reach. It costs nothing and closes the cheapest way out.
+  vm_cmd=(
+    "@runuser@" -u "$gate_user" --
+    "@setpriv@" --no-new-privs --
+    "$ENV_BIN" "${vm_env[@]}" "$runner"
+  )
   if ! runuser -u "$gate_user" -- test -w /dev/kvm 2>/dev/null; then
     log "WARNING: ${gate_user} cannot write /dev/kvm; the gate VM will be emulated and slow"
   fi
@@ -390,6 +429,36 @@ result="$(tr -d '[:space:]' <"$share/result")"
 if [[ ! $result =~ ^[0-9]+$ ]]; then
   keep_logs=1
   die "the VM wrote a malformed verdict; treating as failure"
+fi
+
+# Corroboration, not attestation.
+#
+# The harness writes system-state, then failed-units, then the verdict, in that
+# order. Requiring the earlier artifacts to be present means a verdict that did
+# not come from a completed harness run is rejected: a guest that powered off
+# early, a truncated share, a unit that wrote a 0 out of band before the checks
+# ran. Those are the realistic ways a *broken* configuration passes by accident.
+#
+# It is not a defence against a configuration that is deliberately lying, which
+# writes a consistent set of artifacts just as easily as one file. Nothing
+# running inside the guest can be, because the guest is the thing under test.
+# See SECURITY.md.
+if ((result == 0)); then
+  for artifact in system-state failed-units; do
+    if [[ ! -s "$share/$artifact" ]]; then
+      keep_logs=1
+      echo "vm-gate: the VM reported success but produced no ${artifact}." >&2
+      die "incomplete evidence for a passing verdict; treating as failure"
+    fi
+  done
+  if [[ @requireRunning@ == 1 ]]; then
+    state="$(tr -d '[:space:]' <"$share/system-state")"
+    if [[ $state != running ]]; then
+      keep_logs=1
+      echo "vm-gate: the VM reported success but systemd was '${state}', not 'running'." >&2
+      die "verdict contradicts system state; treating as failure"
+    fi
+  fi
 fi
 
 if ((result != 0)); then
